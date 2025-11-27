@@ -1,0 +1,116 @@
+#%%
+import pandas as pd 
+import numpy as np
+import pyodbc
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.seasonal import seasonal_decompose 
+
+#%%
+pd.set_option('display.max_columns', None)
+
+#%%
+try:
+    def connection(driver, server, user, password, database):
+        conn = pyodbc.connect(
+            f'DRIVER={driver};'            
+            f'SERVER={server};'
+            f'UID={user};'
+            f'PWD={password};'
+            f'DATABASE={database};'
+        )
+        return conn
+    
+    def get_data(conn, query):
+        df = pd.read_sql(query, conn)
+        return df
+    
+    conn = connection(
+         'ODBC Driver 17 for SQL Server',
+         'server',
+         'user',
+         'password',
+         'DB'
+         )
+
+#%%
+
+    if conn:
+        ventas = get_data(conn, "SELECT * FROM DB.dbo.Venta WHERE YEAR(FechaEmision) >= 2023")
+        ventas
+
+        def Fechas(df):
+            df['Fecha'] = pd.to_datetime(df['FechaEmision']).dt.strftime('%Y-%m')
+            df['Año'] = pd.to_datetime(df['FechaEmision']).dt.strftime('%Y')
+            df['Mes'] = pd.to_datetime(df['FechaEmision']).dt.strftime('%m')
+            df['Semana'] = df['FechaEmision'].dt.isocalendar().week
+            df['Trimestre'] = df['FechaEmision'].dt.to_period('Q')
+            df['DiaSemana'] = df['FechaEmision'].dt.strftime('%A')   
+            return df
+        ventas = Fechas(ventas)
+
+        def etl(df):
+            for col in ['Cantidad', 'Precio', 'DescuentoLinea', 'DescuentoGlobal']:
+                if col in df.columns:
+                    df[col] = df[col].fillna(0)
+
+            df['USD'] = ((df['Cantidad'] * df['Precio']) * df['TCUSD'])
+            df['MXN'] = ((df['Cantidad'] * df['Precio']) * df['TCMXN'])
+
+            df['Importe'] = df['Cantidad'] * df['Precio']
+
+            df['Importe'] = df['Importe'] * (1 - (df['DescuentoLinea'] / 100))
+            df['Importe'] = df['Importe'] * (1 - (df['DescuentoGlobal'] / 100))
+
+            df['ImporteNetoUSD'] = df['Importe'] * df['TCUSD']
+            df['ImporteNetoMXN'] = df['Importe'] * df['TCMXN']
+
+            return df
+        ventas = etl(ventas)
+
+        test = (ventas
+        .groupby(['Fecha', 'Almacen'])
+        .agg({
+            'Cantidad': 'sum',
+            'ImporteNetoUSD': 'sum',
+            'ImporteNetoMXN': 'sum'
+        })
+        .sort_values(by='Fecha', ascending=True)
+        .reset_index()
+        .round({'Cantidad':0, 'ImporteNetoUSD':0, 'ImporteNetoMXN':0})
+        )
+
+        print(test.sort_values(by=['Almacen', 'Fecha'], ascending=True).to_string())
+
+#%%
+
+        #Estacionalidad_mensual
+        estacionalidad_mensual = (
+            ventas.groupby(['Fecha'])['MovID']
+            .nunique()
+            .reset_index()
+            .rename(columns={'MovID': 'Transacciones'})
+        )
+
+        plt.figure(figsize=(14,6))
+        sns.lineplot(data=estacionalidad_mensual, x='Fecha', y='Transacciones', marker='o')
+        plt.xticks(rotation=90)
+        plt.title("Transacciones - Serie de tiempo")
+        plt.show()
+
+        # Serie de tiempo con indice de fecha
+        from statsmodels.tsa.seasonal import seasonal_decompose
+
+        serie = estacionalidad_mensual.set_index('Fecha')['Transacciones']
+
+        descomposicion = seasonal_decompose(serie, model='additive', period=12)
+        descomposicion.plot()
+        plt.xlabel('Fecha')
+        plt.xticks(rotation=90)#,fontsize=15,ha='right')
+        plt.legend()
+        plt.show()
+
+        ventas = ventas[ventas['Almacen'] == 'Tienda']
+
+except Exception as e:
+    print(f'Error: {e}')
