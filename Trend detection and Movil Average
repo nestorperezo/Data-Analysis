@@ -1,0 +1,272 @@
+#%%
+import pandas as pd 
+import numpy as np
+import pyodbc
+import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.seasonal import seasonal_decompose 
+
+#%% Documentacion
+"""
+----------------------------------------------------------------------------------------------------
+Proyecto ETL + Integración de Ventas con Inventario + Calculo de StockOut y Promedio Movil (90 dias)
+Autor: NP
+Fecha: 14/11/2025
+----------------------------------------------------------------------------------------------------
+
+Descripcion general:
+Este script realiza una serie de procesos ETL y analisis sobre datos de ventas e inventario para 
+crear un dataset maestro que permita analizar comportamiento comercial, disponibilidad de stock y 
+tendencias de demanda
+
+Flujo General:
+
+1. **Extraccion de Datos**
+   - Se obtienen registros de ventas desde SQL filtrando el año >= 2025
+   - Se obtiene información del inventario desde la tabla `TTR_StockData_v2`
+
+2. **Transformacion de Datos**
+   - Limpieza de datos nulos en metricas financieras (Precio, Cantidad, Descuentos)
+   - Calculo de importes brutos, netos, en MXN y USD
+   - Generacion de calendario continuo entre fechas minima y maxima para evitar huecos temporales
+
+3. **Integracion**
+   - Se generan combinaciones unicas de Articulo + Almacen por cada dia
+   - Se fusionan ventas transformadas + calendario para crear una linea temporal completa
+   - Se integra inventario y se calculan metrica de stock clave
+
+4. **Analisis**
+   - Se calcula un promedio movil de 90 días por Articulo + Almacen
+   - Se preparan subconjuntos de prueba y filtrados especificos
+
+5. **Visualizacion**
+   - Grafico de tendencia entre Cantidad vendida vs Promedio movil
+
+Este pipeline sirve como base analitica para detectar patrones, rotacion, rupturas de inventario y 
+evaluar desempeño comercial con perspectiva temporal.
+
+----------------------------------------------------------------------------------------------------
+"""
+
+#%%
+pd.set_option('display.max_columns', None)
+
+#%%
+try:
+    def connection(driver, server, user, password, database):
+        conn = pyodbc.connect(
+            f'DRIVER={driver};'            
+            f'SERVER={server};'
+            f'UID={user};'
+            f'PWD={password};'
+            f'DATABASE={database};'
+        )
+        return conn
+    
+    def get_data(conn, query):
+        df = pd.read_sql(query, conn)
+        return df
+    
+    conn = connection(
+         'ODBC Driver 17 for SQL Server',
+         'server',
+         'user',
+         'password',
+         'db'
+         )
+
+        # ---------------------------------------------------------------
+        # EXTRACCION DE DATOS
+        # ---------------------------------------------------------------
+
+    if conn:
+        ventas = get_data(conn, "SELECT * FROM db.dbo.Venta WHERE YEAR(FechaEmision) >= 2025")
+
+        # Antes de este paso, se trabajo el Store Procedure en Sql para generar informacion de StockData
+        Inventario = get_data(conn, 'SELECT * FROM db.dbo.TTR_StockData_v2')
+
+
+        # ---------------------------------------------------------------
+        # PROCESAMIENTO DE FECHAS
+        # ---------------------------------------------------------------
+
+        def Fechas(df):
+            """Convierte la columna FechaEmision a datetime y ordena el dataframe cronologicamente"""
+            df['FechaEmision'] = pd.to_datetime(df['FechaEmision'])
+            return df.sort_values(by='FechaEmision', ascending=True)
+
+        ventas = Fechas(ventas)
+
+
+        # ---------------------------------------------------------------
+        # ETL VENTAS: CALCULO DE IMPORTES Y NORMALIZACION
+        # ---------------------------------------------------------------
+
+        def etl(df):
+            """Completa valores nulos y calcula importes brutos, netos y conversiones MXN/USD"""
+            
+            for col in ['Cantidad', 'Precio', 'DescuentoLinea', 'DescuentoGlobal']:
+                if col in df.columns:
+                    df[col] = df[col].fillna(0)
+
+            df['USD'] = (df['Cantidad'] * df['Precio']) * df['TCUSD']
+            df['MXN'] = (df['Cantidad'] * df['Precio']) * df['TCMXN']
+
+            df['Importe'] = df['Cantidad'] * df['Precio']
+            df['Importe'] *= (1 - (df['DescuentoLinea'] / 100))
+            df['Importe'] *= (1 - (df['DescuentoGlobal'] / 100))
+
+            df['ImporteNetoUSD'] = df['Importe'] * df['TCUSD']
+            df['ImporteNetoMXN'] = df['Importe'] * df['TCMXN']
+            return df
+
+        ventas = etl(ventas)
+
+
+        # ---------------------------------------------------------------
+        # TABLA DE CALENDARIO
+        # ---------------------------------------------------------------
+
+        def create_date_table2(start, end):
+            """Genera un calendario continuo entre dos fechas."""
+            return pd.DataFrame({"Date": pd.date_range(start, end)})
+
+        calendario = create_date_table2(
+            start=ventas['FechaEmision'].min(),
+            end=ventas['FechaEmision'].max()
+        )
+
+
+        # ---------------------------------------------------------------
+        # CREACION DE BASE (CALENDARIO + ARTICULOS + ALMACENES)
+        # ---------------------------------------------------------------
+
+        combinaciones = ventas[['Almacen', 'Articulo']].drop_duplicates()
+        calendario['key'] = 1
+        combinaciones['key'] = 1
+
+        base = pd.merge(calendario, combinaciones, on='key').drop(columns='key')
+
+
+        # ---------------------------------------------------------------
+        # AGRUPACION DE VENTAS
+        # ---------------------------------------------------------------
+
+        ventas_agrupadas = ventas.groupby(
+            ['FechaEmision', 'Almacen', 'Articulo', 'Moneda', 'Precio', 'TipoCambio']
+        ).agg({
+            'Cantidad': 'sum',
+            'Importe': 'sum',
+            'ImporteNetoMXN': 'sum',
+            'ImporteNetoUSD': 'sum',
+            'USD': 'sum',
+            'MXN': 'sum'
+        }).reset_index()
+
+
+        # ---------------------------------------------------------------
+        # MERGE BASE CON VENTAS
+        # ---------------------------------------------------------------
+
+        dataset = pd.merge(
+            base,
+            ventas_agrupadas,
+            how='left',
+            left_on=['Date', 'Almacen', 'Articulo'],
+            right_on=['FechaEmision', 'Almacen', 'Articulo']
+        )
+
+        for col in ['Moneda','Precio', 'TipoCambio', 'Cantidad', 'ImporteNetoMXN', 'ImporteNetoUSD', 'USD', 'MXN']:
+            if col in dataset.columns:
+                dataset[col] = dataset[col].fillna(0)
+
+        dataset = dataset[['Date', 'Almacen', 'Articulo', 'Moneda','Precio', 'TipoCambio',
+                        'Cantidad', 'ImporteNetoMXN', 'ImporteNetoUSD', 'USD', 'MXN']]
+
+
+        # ---------------------------------------------------------------
+        # MERGE INVENTARIO
+        # ---------------------------------------------------------------
+
+        def conversion_fechas(df, column_name='Fecha'):
+            """Estandariza columna fecha a formato Date"""
+            df = df.copy()
+            df[column_name] = pd.to_datetime(df[column_name], errors='coerce')
+            df.rename(columns={column_name: 'Date'}, inplace=True)
+            return df
+
+        Inventario = conversion_fechas(Inventario, 'Fecha')
+        dataset = conversion_fechas(dataset, 'Date')
+
+
+        def StockData_merge(df1, df2):
+            """Integra ventas + inventario"""
+            return pd.merge(
+                df1, df2, how='outer', on=['Date', 'Almacen', 'Articulo']
+            ).reset_index(drop=True)
+
+        StockData = StockData_merge(dataset, Inventario)
+
+
+        def columns(df):
+            """Limpia columnas clave de stock"""
+            for col in ['Existencia', 'Asignado', 'Transito']:
+                if col in df.columns:
+                    df[col] = df[col].fillna(0)
+            return df.sort_values(by=['Almacen', 'Articulo', 'Date']).reset_index(drop=True)
+
+        StockData = columns(StockData)
+
+
+        # ---------------------------------------------------------------
+        # CALCULO DE PROMEDIO MOVIL (WINDOW 90 DIAS)
+        # ---------------------------------------------------------------
+
+        StockData['PromedioMovil'] = (
+            StockData.groupby(['Almacen', 'Articulo'])
+            .rolling(window='90D', on='Date')['Cantidad']
+            .mean()
+            .reset_index(drop=True)
+            .round()
+        )
+
+
+        # ---------------------------------------------------------------
+        # SUBCONJUNTOS DE PRUEBA
+        # ---------------------------------------------------------------
+
+        test = StockData[
+            (StockData['Almacen'] == 'Tienda') &
+            (StockData['Articulo'] == 'Articulo') &
+            (StockData['Date'] > '2025-10-29')
+        ].reset_index()
+
+        x = StockData[
+            (StockData['Cantidad'] > 10) &
+            (StockData['Date'] > '2025-10-29')
+        ].reset_index(drop=True)
+
+
+        # ---------------------------------------------------------------
+        # VISUALIZACION
+        # ---------------------------------------------------------------
+
+        fig, ax = plt.subplots(figsize=(10,5))
+
+        sns.lineplot(data=StockData, x='Date', y='Cantidad', ax=ax, color='blue', label='Cantidad')
+        ax.set_xlabel('Fecha')
+        ax.set_ylabel('Cantidad', color='blue')
+
+        ax2 = ax.twinx()
+        sns.lineplot(data=StockData, x='Date', y='PromedioMovil', ax=ax2, color='red', linestyle='--', label='Promedio')
+        ax2.set_ylabel('Promedio', color='red')
+
+        ax.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+
+        plt.title('Cantidad vs Promedio Movil (90 dias)')
+        plt.show()
+
+except Exception as e:
+    print(f"Error: {e}")
